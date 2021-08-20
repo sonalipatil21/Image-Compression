@@ -1,154 +1,149 @@
 #!/usr/bin/env python3
-# Huffman binary compression and decompression
-#
-# Example usage:
-# Compressor.Compressor(file name)
-# decompressor = Decompressor(compressed file name)
-# decompressor.decompress()
+import time
 
-import sys
-from math import ceil
+from PIL import Image
+from PIL import ImageChops
 
-LEFT = '1'
-RIGHT = '0'
+from collections import Counter
+from itertools import chain
 
-
-class Leaf:
-    def __init__(self, data, value):
-        self.data = data
-        self.value = value
-        self.parent = None
-        self.code = ''
-
-    def __str__(self):
-        return str(self.data)
-
-    def __repr__(self):
-        return self.__str__()
-
-    def update_code(self, update):
-        self.code = update + self.code
-
-class Node:
-    def __init__(self, left, right, value):
-        self.value = value
-        self.left = left
-        self.right = right
-        self.code = ''
-        self.left.update_code(LEFT)
-        self.right.update_code(RIGHT)
-
-    def __str__(self):
-        return str(self.value)
-
-    def __repr__(self):
-        return self.__str__()
-
-    def update_code(self, update):
-        self.code = update + self.code
-        self.left.update_code(update)
-        self.right.update_code(update)
+import BitUtils
+from BitUtils import OutBitStream
+from BitUtils import InBitStream
 
 
-def build_tree(byte_freq):
-    tree = [Leaf(bf, bf[1]) for bf in byte_freq]
-    leaves = []
+class Huffman(object):
 
-    while len(tree) > 1:
-        left, right = tree[:2]
-        if type(left) is Leaf:
-            leaves.append(left)
-        if type(right) is Leaf:
-            leaves.append(right)
-        tree = tree[2:]
-        node = Node(left, right, left.value + right.value)
-        tree.append(node)
-        tree = sorted(tree, key=lambda node: node.value)
+    def __init__(self, file_name):
+        self.file_name = file_name
+        self.bit_stream = None
 
-    return leaves, tree[0]
+    def raw_size(self, width, height):
+        header_size = 2 * 16  # height and width as 16 bit values
+        pixels_size = 3 * 8 * width * height  # 3 channels, 8 bits per channel
+        return (header_size + pixels_size) / 8
 
+    # Compression
+    def count_symbols(self, image):
+        pixels = image.getdata()
+        values = chain.from_iterable(pixels)
+        counts = Counter(values).items()
+        return sorted(counts, key=lambda x: x[::-1])
 
-class Compressor:
-    @staticmethod
-    def get_frequencies(input_bytes):
-        byte_set = set(input_bytes)
+    def build_tree(self, counts):
+        nodes = [entry[::-1] for entry in counts]  # Reverse each (symbol,count) tuple
+        while len(nodes) > 1:
+            least_two = tuple(nodes[0:2])  # get the 2 to combine
+            the_rest = nodes[2:]  # all the others
+            comb_freq = least_two[0][0] + least_two[1][0]  # the branch points freq
+            nodes = the_rest + [(comb_freq, least_two)]  # add branch point to the end
+            nodes.sort(key=lambda t: t[0])
+        return nodes[0]  # Return the single tree inside the list
 
-        byte_freq_dict = {b: 0 for b in byte_set}
+    def trim_tree(self, tree):
+        p = tree[1]  # Ignore freq count in [0]
+        if type(p) is tuple:  # Node, trim left then right and recombine
+            return self.trim_tree(p[0]), self.trim_tree(p[1])
+        return p  # Leaf, just return it
 
-        for b in input_bytes:
-            byte_freq_dict[b] = byte_freq_dict[b] + 1
+    def assign_codes_impl(self, codes, node, pat):
+        if type(node) == tuple:
+            self.assign_codes_impl(codes, node[0], pat + [0])  # Branch point. Do the left branch
+            self.assign_codes_impl(codes, node[1], pat + [1])  # then do the right branch.
+        else:
+            codes[node] = pat  # A leaf. set its code
 
-        return sorted([item for item in byte_freq_dict.items()], key=lambda item:item[1])
+    def assign_codes(self, tree):
+        codes = {}
+        self.assign_codes_impl(codes, tree, [])
+        return codes
 
-    def compress(filename):
-        input_bytes = []
-        with open(filename, 'rb') as bin_file:
-            input_bytes = bin_file.read()
+    def encode_header(self, image):
+        height_bits = BitUtils.pad_bits(BitUtils.to_binary_list(image.height), 16)
+        self.bit_stream.write_bits(height_bits)
+        width_bits = BitUtils.pad_bits(BitUtils.to_binary_list(image.width), 16)
+        self.bit_stream.write_bits(width_bits)
 
-        print('Input size (in bits)    :', len(input_bytes) * 8)
-        byte_freq = Compressor.get_frequencies(input_bytes)
-        leaves, _ = build_tree(byte_freq)
-        symbol_map = {leaf.data[0]: leaf.code for leaf in leaves}
+    def encode_tree(self, tree):
+        if type(tree) == tuple:  # Note - write 0 and encode children
+            self.bit_stream.write_bit(0)
+            self.encode_tree(tree[0])
+            self.encode_tree(tree[1])
+        else:  # Leaf - write 1, followed by 8 bit symbol
+            self.bit_stream.write_bit(1)
+            symbol_bits = BitUtils.pad_bits(BitUtils.to_binary_list(tree), 8)
+            self.bit_stream.write_bits(symbol_bits)
 
-        output_bits = '1'
-        for b in input_bytes:
-            output_bits = output_bits + symbol_map[b]
+    def encode_pixels(self, image, codes):
+        for pixel in image.getdata():
+            for value in pixel:
+                self.bit_stream.write_bits(codes[value])
 
-        byte_count = (len(output_bits)+7) // 8
-        output_int = int(output_bits, 2)
-        output_bytes = output_int.to_bytes(byte_count, sys.byteorder)
-        max_count_bytes = ceil(leaves[-1].data[1].bit_length()/8)
+    # Compress image
+    def compress_image(self, in_file_name, out_file_name):
+        print('Compressing "%s" => "%s"' % (in_file_name, out_file_name))
+        image = Image.open(in_file_name)
 
-        header_bytes = len(leaves).to_bytes(2, sys.byteorder)
-        header_bytes += max_count_bytes.to_bytes(8, sys.byteorder)
+        size_raw = self.raw_size(image.height, image.width)
+        print('RAW image size: %d bytes' % size_raw)
 
-        for leaf in leaves:
-            header_bytes += (leaf.data[0].to_bytes(1, sys.byteorder))
-            header_bytes += leaf.data[1].to_bytes(max_count_bytes, sys.byteorder)
+        counts = self.count_symbols(image)
+        tree = self.build_tree(counts)
+        trimmed_tree = self.trim_tree(tree)
+        codes = self.assign_codes(trimmed_tree)
 
-        with open(filename + '.huf', 'wb') as out_file:
-            out_file.write(header_bytes)
-            out_file.write(output_bytes)
+        self.bit_stream = OutBitStream(out_file_name)
+        self.encode_header(image)
+        self.bit_stream.flush()  # make sure next chunk is byte-aligned
+        self.encode_tree(trimmed_tree)
+        self.bit_stream.flush()  # make sure next chunk is byte-aligned
 
-        print('Compressed size (in bits):', (len(output_bytes) + len(header_bytes)) * 8)
-        print('Compression Ratio        : {:.2f} %'.format(((len(output_bytes) + len(header_bytes)) / len(input_bytes)) * 100))
+        start_time = time.time()
+        self.encode_pixels(image, codes)
+        self.bit_stream.close()
 
+        size_real = self.bit_stream.bytes_written
 
-class Decompressor:
-    def __init__(self, filename):
-        self.filename = filename
-        self.out_filename = '.'.join(filename.split('.')[:-1])
+        print('Compression ratio: %0.2f%%' % (float(size_real * 100) / size_raw))
 
-    # Read decompressed file
-    def read_file(self):
-        byte_freq = []
-        input_bytes = None
-        with open(self.filename, 'rb') as input_file:
-            leaves_count = int.from_bytes(input_file.read(2), sys.byteorder)
-            max_count_bytes = int.from_bytes(input_file.read(8), sys.byteorder)
-            while leaves_count > 0:
-                b = input_file.read(1)
-                c = int.from_bytes(input_file.read(max_count_bytes), sys.byteorder)
-                byte_freq.append((b, c))
-                leaves_count -= 1
-            input_bytes = input_file.read()
-        return input_bytes, byte_freq
+    # Decompression
+    def decode_header(self):
+        height = BitUtils.from_binary_list(self.bit_stream.read_bits(16))
+        width = BitUtils.from_binary_list(self.bit_stream.read_bits(16))
+        return height, width
 
-    def decompress(self):
-        input_bytes, byte_freq = self.read_file()
-        _, tree = build_tree(byte_freq)
-        input_bits = bin(int.from_bytes(input_bytes, sys.byteorder))[3:]
-        output_bytes = b''
-        cur_node = tree
-        for bit in input_bits:
-            if bit == LEFT:
-                cur_node = cur_node.left
-            else:
-                cur_node = cur_node.right
+    def decode_tree(self):
+        flag = self.bit_stream.read_bits(1)[0]
+        if flag == 1:  # Leaf, read and return symbol
+            return BitUtils.from_binary_list(self.bit_stream.read_bits(8))
+        left = self.decode_tree()
+        right = self.decode_tree()
+        return left, right
 
-            if type(cur_node) is Leaf:
-                output_bytes += cur_node.data[0]
-                cur_node = tree
+    def decode_value(self, tree):
+        bit = self.bit_stream.read_bits(1)[0]
+        node = tree[bit]
+        if type(node) == tuple:
+            return self.decode_value(node)
+        return node
 
-        with open(self.out_filename, 'wb') as output_file:
-            output_file.write(output_bytes)
+    def decode_pixels(self, height, width, tree):
+        pixels = bytearray()
+        for i in range(height * width * 3):
+            pixels.append(self.decode_value(tree))
+        return Image.frombytes('RGB', (width, height), bytes(pixels))
+
+    # Decompress image
+    def decompress_image(self, in_file_name, out_file_name):
+        print('Decompressing "%s" => "%s"' % (in_file_name, out_file_name))
+
+        self.bit_stream = InBitStream(in_file_name)
+        height, width = self.decode_header()
+        self.bit_stream.flush()  # make sure the next chunk is byte-aligned
+
+        trimmed_tree = self.decode_tree()
+        self.bit_stream.flush()  # make sure next chunk is byte-aligned
+        image = self.decode_pixels(height, width, trimmed_tree)
+        self.bit_stream.close()
+
+        image.save(out_file_name)
