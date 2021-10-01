@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Name: Sonali Patil | Class: COMP 157 |  Project: 3
-# Python ImageCompression or decompression processor
+# Name: Sonali Patil
+# Python Image Compression and Decompression Processor
 #
 # Example usage
 #
